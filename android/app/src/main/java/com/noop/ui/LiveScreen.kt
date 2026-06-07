@@ -61,9 +61,19 @@ fun LiveScreen(viewModel: AppViewModel) {
             val (label, tone) = when {
                 live.bonded -> "Bonded" to StrandTone.Positive
                 live.connected -> "Connected" to StrandTone.Warning
+                live.scanning -> "Searching…" to StrandTone.Warning
                 else -> "Disconnected" to StrandTone.Critical
             }
-            StatePill(label, tone = tone, pulsing = live.bonded)
+            StatePill(label, tone = tone, pulsing = live.bonded || live.scanning)
+        }
+        // Why it's in this state and what to try (permission, strap busy, not found…).
+        live.statusNote?.let { note ->
+            Text(
+                note,
+                style = NoopType.footnote,
+                color = Palette.textSecondary,
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
 
         // Big HR card.

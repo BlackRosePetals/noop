@@ -66,8 +66,12 @@ data class LiveState(
     val heartRate: Int? = null,
     val rr: List<Int> = emptyList(),
     val batteryPct: Double? = null,
-    val worn: Boolean = true,
+    val worn: Boolean = false,
     val lastEvent: String? = null,
+    /** True while actively scanning for the strap (so the UI can show "Searching…"). */
+    val scanning: Boolean = false,
+    /** Human-readable reason for the current state (why it can't connect, what to try). */
+    val statusNote: String? = null,
 )
 
 /**
@@ -147,6 +151,8 @@ class WhoopBleClient(
 
         /** Auto-rescan delay after an unintentional disconnect (BLEManager: "rescanning in 3s"). */
         private const val RECONNECT_DELAY_MS = 3_000L
+        /** Give up a scan after this long with no strap found, and tell the user why. */
+        private const val SCAN_TIMEOUT_MS = 20_000L
 
         // MARK: Live-persistence cadence (port of Swift CollectorPolicy.default).
         /** Flush the live buffer after this many frames OR [FLUSH_MAX_INTERVAL_MS], whichever first. */
@@ -235,6 +241,20 @@ class WhoopBleClient(
     /** All BLE work hops onto the main looper, matching CBCentralManager(queue: .main). */
     private val handler = Handler(Looper.getMainLooper())
 
+    /** Fired if a scan finds nothing in [SCAN_TIMEOUT_MS]; stops scanning and explains why. */
+    private val scanTimeoutRunnable = Runnable {
+        if (scanning && !_state.value.connected) {
+            stopScan()
+            log("No WHOOP strap found within ${SCAN_TIMEOUT_MS / 1000}s")
+            _state.value = _state.value.copy(
+                scanning = false,
+                statusNote = "No strap found. Check it's charged and on your wrist, and that the " +
+                    "official WHOOP app isn't connected to it (a strap will only pair with one app " +
+                    "at a time). Then tap Connect again.",
+            )
+        }
+    }
+
     // ====================================================================================
     // MARK: Persistence + historical offload (NEW — ports BLEManager.swift Collector/Backfiller)
     // ====================================================================================
@@ -322,11 +342,14 @@ class WhoopBleClient(
         val adp = adapter
         if (adp == null || !adp.isEnabled) {
             log("Bluetooth not powered on; cannot scan yet")
+            _state.value = _state.value.copy(
+                scanning = false, statusNote = "Bluetooth is off. Turn it on, then tap Connect.")
             return
         }
         val sc = scanner
         if (sc == null) {
             log("No BLE scanner available")
+            _state.value = _state.value.copy(statusNote = "Bluetooth isn't ready yet. Try again in a moment.")
             return
         }
         if (scanning) {
@@ -346,7 +369,27 @@ class WhoopBleClient(
             .build()
         log("Scanning for WHOOP service…")
         scanning = true
-        sc.startScan(filters, settings, scanCallback)
+        _state.value = _state.value.copy(scanning = true, statusNote = "Searching for your strap…")
+        try {
+            sc.startScan(filters, settings, scanCallback)
+        } catch (se: SecurityException) {
+            // Android 12+: BLUETOOTH_SCAN/CONNECT not granted. This is the #1 reason connect fails.
+            scanning = false
+            log("Scan blocked (permission): ${se.message}")
+            _state.value = _state.value.copy(
+                scanning = false,
+                statusNote = "NOOP needs the Nearby devices / Bluetooth permission. Allow it in " +
+                    "Settings → Apps → NOOP → Permissions, then tap Connect.")
+            return
+        } catch (t: Throwable) {
+            scanning = false
+            log("Scan failed to start: ${t.message}")
+            _state.value = _state.value.copy(scanning = false, statusNote = "Couldn't start scanning: ${t.message}")
+            return
+        }
+        // Stop and explain if nothing turns up in time.
+        handler.removeCallbacks(scanTimeoutRunnable)
+        handler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
     }
 
     /**
@@ -356,7 +399,9 @@ class WhoopBleClient(
     @SuppressLint("MissingPermission")
     fun disconnect() {
         intentionalDisconnect = true
+        handler.removeCallbacks(scanTimeoutRunnable)
         stopScan()
+        _state.value = _state.value.copy(scanning = false, statusNote = null)
         gatt?.disconnect()   // onConnectionStateChange(DISCONNECTED) does the teardown + close.
     }
 
@@ -415,6 +460,9 @@ class WhoopBleClient(
             val device: BluetoothDevice = result.device
             val name = result.scanRecord?.deviceName ?: device.name ?: "unknown"
             log("Discovered $name (rssi ${result.rssi}) — connecting")
+            // Found it: cancel the not-found timeout and reflect progress in the UI.
+            handler.removeCallbacks(scanTimeoutRunnable)
+            _state.value = _state.value.copy(statusNote = "Found $name, connecting…")
             // Port of didDiscover: stop scanning, then connect to this peripheral.
             stopScan()
             connectToDevice(device)
@@ -450,7 +498,8 @@ class WhoopBleClient(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     // Port of didConnect: mark connected, then discover services.
-                    _state.value = _state.value.copy(connected = true)
+                    handler.removeCallbacks(scanTimeoutRunnable)
+                    _state.value = _state.value.copy(connected = true, scanning = false, statusNote = null)
                     log("Connected — discovering services")
                     g.discoverServices()
                 }
